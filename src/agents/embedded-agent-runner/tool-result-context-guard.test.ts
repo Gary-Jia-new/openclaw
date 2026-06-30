@@ -1,6 +1,6 @@
 // Tool-result context guard tests cover live replay truncation, mid-turn
 // prechecks, and context-engine loop hooks for oversized tool outputs.
-import type { AgentMessage, BashExecutionMessage } from "openclaw/plugin-sdk/agent-core";
+import type { AgentMessage } from "openclaw/plugin-sdk/agent-core";
 import { describe, expect, it, vi } from "vitest";
 import type { ContextEngine, ContextEngineRuntimeSettings } from "../../context-engine/types.js";
 import { sanitizeToolUseResultPairing } from "../session-transcript-repair.js";
@@ -473,8 +473,9 @@ describe("installToolResultContextGuard", () => {
       timestamp: Date.now(),
     } as unknown as AgentMessage);
     // excludeFromContext → estimate = 0 → guard should NOT overflow
-    const transformed = await applyGuardToContext(agent, [makeUser("hi"), excludedBash], 500);
-    expect(transformed).toEqual([makeUser("hi"), excludedBash]);
+    const userMsg = makeUser("hi");
+    const transformed = await applyGuardToContext(agent, [userMsg, excludedBash], 500);
+    expect(transformed).toEqual([userMsg, excludedBash]);
   });
 });
 
