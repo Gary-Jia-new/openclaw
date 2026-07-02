@@ -4,8 +4,9 @@ import { normalizeOptionalString } from "@openclaw/normalization-core/string-coe
 import { modelKey } from "../../agents/model-ref-shared.js";
 import { normalizeModelRef } from "../../agents/model-selection.js";
 import type { NormalizedUsage, UsageLike } from "../../agents/usage.js";
-import { normalizeUsage } from "../../agents/usage.js";
+import { hasNonzeroUsage, normalizeUsage } from "../../agents/usage.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { emitTrustedDiagnosticEvent, isDiagnosticsEnabled } from "../../infra/diagnostic-events.js";
 import type { Api, Message } from "../../llm/types.js";
 import { getChildLogger } from "../../logging.js";
 import { normalizeAgentId } from "../../routing/session-key.js";
@@ -475,6 +476,24 @@ export function createRuntimeLlm(options: CreateRuntimeLlmOptions = {}): PluginR
         model: prepared.selection.modelId,
         usage,
       });
+
+      if (isDiagnosticsEnabled(cfg) && hasNonzeroUsage(normalizedUsage)) {
+        emitTrustedDiagnosticEvent({
+          type: "model.usage",
+          sessionKey: options.authority?.sessionKey,
+          agentId,
+          provider: prepared.selection.provider,
+          model: prepared.selection.modelId,
+          usage: {
+            input: normalizedUsage.input,
+            output: normalizedUsage.output,
+            cacheRead: normalizedUsage.cacheRead,
+            cacheWrite: normalizedUsage.cacheWrite,
+            total: normalizedUsage.total,
+          },
+          costUsd: usage.costUsd,
+        });
+      }
 
       return {
         text,

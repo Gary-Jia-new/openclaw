@@ -10,12 +10,19 @@ const hoisted = vi.hoisted(() => ({
   prepareSimpleCompletionModelForAgent: vi.fn(),
   completeWithPreparedSimpleCompletionModel: vi.fn(),
   resolveSimpleCompletionSelectionForAgent: vi.fn(),
+  emitTrustedDiagnosticEvent: vi.fn(),
+  isDiagnosticsEnabled: vi.fn(),
 }));
 
 vi.mock("../../agents/simple-completion-runtime.js", () => ({
   prepareSimpleCompletionModelForAgent: hoisted.prepareSimpleCompletionModelForAgent,
   completeWithPreparedSimpleCompletionModel: hoisted.completeWithPreparedSimpleCompletionModel,
   resolveSimpleCompletionSelectionForAgent: hoisted.resolveSimpleCompletionSelectionForAgent,
+}));
+
+vi.mock("../../infra/diagnostic-events.js", () => ({
+  emitTrustedDiagnosticEvent: hoisted.emitTrustedDiagnosticEvent,
+  isDiagnosticsEnabled: hoisted.isDiagnosticsEnabled,
 }));
 
 const cfg = {
@@ -145,6 +152,9 @@ describe("runtime.llm.complete", () => {
     hoisted.prepareSimpleCompletionModelForAgent.mockReset();
     hoisted.completeWithPreparedSimpleCompletionModel.mockReset();
     hoisted.resolveSimpleCompletionSelectionForAgent.mockReset();
+    hoisted.emitTrustedDiagnosticEvent.mockReset();
+    hoisted.isDiagnosticsEnabled.mockReset();
+    hoisted.isDiagnosticsEnabled.mockReturnValue(true);
     primeCompletionMocks();
   });
 
@@ -767,5 +777,54 @@ describe("runtime.llm.complete", () => {
     expectSingleLogPayload(logger.warn as unknown as MockCalls, "plugin llm completion denied", {
       reason: "not trusted",
     });
+  });
+
+  it("emits model.usage diagnostic for plugin LLM calls when diagnostics are enabled", async () => {
+    const logger = createLogger();
+    const llm = createRuntimeLlm({
+      getConfig: () => cfg,
+      logger,
+      authority: {
+        allowComplete: true,
+      },
+    });
+
+    const result = await llm.complete({
+      messages: [{ role: "user", content: "Ping" }],
+    });
+
+    expect(hoisted.emitTrustedDiagnosticEvent).toHaveBeenCalledTimes(1);
+    const event = hoisted.emitTrustedDiagnosticEvent.mock.calls[0]?.[0];
+    expect(event).toBeDefined();
+    const usage = event as Record<string, unknown>;
+    expect(usage.type).toBe("model.usage");
+    expect(usage.provider).toBe("openai");
+    expect(usage.model).toBe("gpt-5.5");
+    const usageBlock = requireRecord(usage.usage, "diagnostic usage");
+    expect(usageBlock.input).toBe(11);
+    expect(usageBlock.output).toBe(7);
+    expect(usageBlock.cacheRead).toBe(5);
+    expect(usageBlock.cacheWrite).toBe(2);
+    expect(usageBlock.total).toBe(25);
+    expect(usage.costUsd).toBe(0.0042);
+    expect(result.usage?.costUsd).toBe(0.0042);
+  });
+
+  it("skips model.usage diagnostic when diagnostics are disabled", async () => {
+    hoisted.isDiagnosticsEnabled.mockReturnValue(false);
+    const logger = createLogger();
+    const llm = createRuntimeLlm({
+      getConfig: () => cfg,
+      logger,
+      authority: {
+        allowComplete: true,
+      },
+    });
+
+    await llm.complete({
+      messages: [{ role: "user", content: "Ping" }],
+    });
+
+    expect(hoisted.emitTrustedDiagnosticEvent).not.toHaveBeenCalled();
   });
 });
