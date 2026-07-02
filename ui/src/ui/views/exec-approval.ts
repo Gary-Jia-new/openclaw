@@ -9,7 +9,7 @@ import type {
   ExecApprovalRequest,
   ExecApprovalRequestPayload,
 } from "../controllers/exec-approval.ts";
-import { formatSessionKeyForDisplay } from "../session-display.ts";
+import { parseSessionKey } from "../session-display.ts";
 
 const DEFAULT_EXEC_APPROVAL_DECISIONS = [
   "allow-once",
@@ -35,7 +35,11 @@ function formatSessionKey(key?: string | null): string {
   if (!key) {
     return "";
   }
-  return formatSessionKeyForDisplay(key);
+  // Preserve the full identifier in approval dialogs so operators can
+  // identify the exact session target. Activity views use
+  // formatSessionKeyForDisplay for compact inline display with
+  // truncation only where space is constrained.
+  return parseSessionKey(key).fallbackName;
 }
 
 function renderMetaRow(label: string, value?: string | null, opts?: { path?: boolean }) {
