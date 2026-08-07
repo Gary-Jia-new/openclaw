@@ -17,6 +17,8 @@ import {
   resolveRunStaleThresholdMs,
 } from "../../logging/diagnostic-run-activity.js";
 import { diagnosticLogger as diag } from "../../logging/diagnostic-runtime.js";
+import type { MediaFact } from "../../media/media-facts.js";
+import type { PromptImageOrderEntry } from "../../media/prompt-image-order.js";
 import type { UserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.types.js";
 import { resolveGlobalSingleton } from "../../shared/global-singleton.js";
 import { resolveTimerTimeoutMs } from "../../shared/number-coercion.js";
@@ -40,12 +42,21 @@ export type ReplyBackendQueueMessageOptions = {
   debounceMs?: number;
   /** Ordered current-turn images to inject with the steering text. */
   images?: ImageContent[];
+  imageOrder?: PromptImageOrderEntry[];
+  /** Ordered facts represented by attachment text in this steering prompt. */
+  media?: MediaFact[];
   deliveryTimeoutMs?: number;
   waitForTranscriptCommit?: boolean;
   sourceReplyDeliveryMode?: SourceReplyDeliveryMode;
   taskSuggestionDeliveryMode?: TaskSuggestionDeliveryMode;
   /** Prepared channel turn to merge only at transcript persistence. */
   userTurnTranscriptRecorder?: UserTurnTranscriptRecorder;
+};
+
+export type ReplyBackendQueueMessageResult = {
+  /** Acceptance was irreversible, but the harness could not prove transcript commitment. */
+  transcriptCommit: "unconfirmed";
+  errorMessage: string;
 };
 
 export type ReplyBackendHandle = {
@@ -58,7 +69,10 @@ export type ReplyBackendHandle = {
   isStreaming(): boolean;
   isStopped?: () => boolean;
   isAbortable?: () => boolean;
-  queueMessage?: (text: string, options?: ReplyBackendQueueMessageOptions) => Promise<void>;
+  queueMessage?: (
+    text: string,
+    options?: ReplyBackendQueueMessageOptions,
+  ) => Promise<void | ReplyBackendQueueMessageResult>;
   /**
    * Compatibility-only hook so legacy "abort compacting runs" paths can still
    * find embedded runs that are compacting during the main run phase.
@@ -103,6 +117,7 @@ export function resolveReplyBackendQueueMessageMismatch(
 export type ReplyOperationPhase =
   | "queued"
   | "waiting_for_deferred_maintenance"
+  | "waiting_for_global_lane"
   | "preflight_compacting"
   | "memory_flushing"
   | "running"
@@ -131,6 +146,8 @@ export type ReplyOperation = {
   /** Gateway lifecycle that admitted this process-local owner. */
   readonly lifecycleGeneration?: string;
   readonly routeThreadId?: string | number;
+  /** Transcript branch leaf from which this operation was admitted. */
+  readonly originatingLeafEntryId?: string | null;
   readonly abortSignal: AbortSignal;
   readonly resetTriggered: boolean;
   /**
@@ -147,6 +164,8 @@ export type ReplyOperation = {
   readonly acceptedSteeredInboundAudio: boolean;
   readonly phase: ReplyOperationPhase;
   readonly result: ReplyOperationResult | null;
+  /** Set when a stale-watchdog expiry forced this operation's run_stalled result. */
+  readonly staleExpiryReason?: ReplyOperationStaleReason;
   readonly startedAtMs: number;
   readonly lastActivityAtMs: number;
   /** True when this operation has owned the supplied session ID. */
@@ -156,6 +175,7 @@ export type ReplyOperation = {
     next:
       | "queued"
       | "waiting_for_deferred_maintenance"
+      | "waiting_for_global_lane"
       | "preflight_compacting"
       | "memory_flushing"
       | "running",
@@ -164,6 +184,10 @@ export type ReplyOperation = {
   markWaitingForDeferredMaintenance(): void;
   /** Return a maintenance-waiting operation to queued if the run has not started. */
   markDeferredMaintenanceWaitEnded(): void;
+  /** Mark this operation as waiting for process-global run capacity. */
+  markWaitingForGlobalLane(): void;
+  /** Return a global-lane-waiting operation to queued once capacity is granted. */
+  markGlobalLaneWaitEnded(): void;
   /** Mark this operation as an in-flight terminal-session recovery. */
   markTerminalRecovery(): void;
   markAcceptedSteeredInboundAudio(): void;
@@ -210,11 +234,16 @@ type ReplyRunRegistry = {
     sessionId: string;
     resetTriggered: boolean;
     routeThreadId?: string | number;
+    originatingLeafEntryId?: string | null;
     upstreamAbortSignal?: AbortSignal;
   }): ReplyOperation;
   get(sessionKey: string): ReplyOperation | undefined;
   isActive(sessionKey: string): boolean;
   isStreaming(sessionKey: string): boolean;
+  isStreamingFromOriginatingLeaf(
+    sessionKey: string,
+    originatingLeafEntryId: string | null,
+  ): boolean;
   abort(sessionKey: string): boolean;
   waitForIdle(
     sessionKey: string,
@@ -343,7 +372,11 @@ function isReplyRunCompacting(operation: ReplyOperation): boolean {
 }
 
 function isReplyOperationPreBackendPhase(phase: ReplyOperationPhase): boolean {
-  return phase === "queued" || phase === "waiting_for_deferred_maintenance";
+  return (
+    phase === "queued" ||
+    phase === "waiting_for_deferred_maintenance" ||
+    phase === "waiting_for_global_lane"
+  );
 }
 
 const attachedBackendByOperation = new WeakMap<ReplyOperation, ReplyBackendHandle>();
@@ -542,6 +575,7 @@ export function createReplyOperation(params: {
   sessionId: string;
   resetTriggered: boolean;
   routeThreadId?: string | number;
+  originatingLeafEntryId?: string | null;
   upstreamAbortSignal?: AbortSignal;
   respectFollowupAdmissionBarrier?: boolean;
 }): ReplyOperation {
@@ -569,6 +603,8 @@ export function createReplyOperation(params: {
   let currentSessionKey = sessionKey;
   let currentSessionId = sessionId;
   let phase: ReplyOperationPhase = "queued";
+  let phaseBeforeGlobalLaneWait: "queued" | "running" | undefined;
+  let staleExpiryReason: ReplyOperationStaleReason | undefined;
   let result: ReplyOperationResult | null = null;
   let stateCleared = false;
   let retainFailureUntilComplete = false;
@@ -674,6 +710,9 @@ export function createReplyOperation(params: {
     get routeThreadId() {
       return params.routeThreadId;
     },
+    get originatingLeafEntryId() {
+      return params.originatingLeafEntryId;
+    },
     get abortSignal() {
       return controller.signal;
     },
@@ -691,6 +730,9 @@ export function createReplyOperation(params: {
     },
     get result() {
       return result;
+    },
+    get staleExpiryReason() {
+      return staleExpiryReason;
     },
     get startedAtMs() {
       return startedAtMs;
@@ -732,6 +774,32 @@ export function createReplyOperation(params: {
         sessionKey: currentSessionKey,
         sessionId: currentSessionId,
         reason: "deferred_maintenance:wait_ended",
+      });
+    },
+    markWaitingForGlobalLane() {
+      if (result || (phase !== "queued" && phase !== "running")) {
+        return;
+      }
+      // Queued-on-lane is healthy waiting, not a wedged run. Removing this phase
+      // lets stale recovery silently drop replies while global capacity is busy.
+      phaseBeforeGlobalLaneWait = phase;
+      phase = "waiting_for_global_lane";
+      markReplyRunDiagnosticProgress({
+        sessionKey: currentSessionKey,
+        sessionId: currentSessionId,
+        reason: "global_lane:waiting",
+      });
+    },
+    markGlobalLaneWaitEnded() {
+      if (result || phase !== "waiting_for_global_lane") {
+        return;
+      }
+      phase = phaseBeforeGlobalLaneWait ?? "queued";
+      phaseBeforeGlobalLaneWait = undefined;
+      markReplyRunDiagnosticProgress({
+        sessionKey: currentSessionKey,
+        sessionId: currentSessionId,
+        reason: "global_lane:wait_ended",
       });
     },
     markTerminalRecovery() {
@@ -920,6 +988,9 @@ export function createReplyOperation(params: {
     if (!result) {
       abortFrozenOperations.add(operation);
       detachUpstreamAbort();
+      // The reason distinguishes pre-run drops (user got nothing; feedback owed)
+      // from post-output stalls (finalization/terminal cleanup; feedback is noise).
+      staleExpiryReason = reason;
       setResult({ kind: "failed", code: "run_stalled" });
       phase = "failed";
     }
@@ -1059,8 +1130,20 @@ export function isReplyRunEvidenceStale(operation: ReplyOperation): boolean {
   });
   return (
     !operation.result &&
+    operation.phase !== "waiting_for_global_lane" &&
     Date.now() - operation.lastActivityAtMs > resolveRunStaleThresholdMs(activity)
   );
+}
+
+export function markReplyOperationGlobalLaneWaitProgress(operation: ReplyOperation): void {
+  if (operation.result || operation.phase !== "waiting_for_global_lane") {
+    return;
+  }
+  markReplyRunDiagnosticProgress({
+    sessionKey: operation.key,
+    sessionId: operation.sessionId,
+    reason: "global_lane:waiting",
+  });
 }
 
 export function isReplyRunEvidenceStaleBySessionId(sessionId: string): boolean {
@@ -1089,6 +1172,17 @@ export const replyRunRegistry: ReplyRunRegistry = {
   isStreaming(sessionKey) {
     const operation = this.get(sessionKey);
     if (!operation || operation.phase !== "running") {
+      return false;
+    }
+    return getAttachedBackend(operation)?.isStreaming() ?? false;
+  },
+  isStreamingFromOriginatingLeaf(sessionKey, originatingLeafEntryId) {
+    const operation = this.get(sessionKey);
+    if (
+      !operation ||
+      operation.phase !== "running" ||
+      operation.originatingLeafEntryId !== originatingLeafEntryId
+    ) {
       return false;
     }
     return getAttachedBackend(operation)?.isStreaming() ?? false;
@@ -1228,14 +1322,24 @@ export function abortReplyRunBySessionId(sessionId: string): boolean {
   return operation.abortByUser();
 }
 
-export function forceClearReplyRunBySessionId(sessionId: string, cause?: unknown): boolean {
-  const operation = resolveReplyRunForCurrentSessionId(sessionId);
-  if (!operation) {
+export function resolveActiveReplyOperationForSessionId(
+  sessionId: string,
+): ReplyOperation | undefined {
+  return resolveReplyRunForCurrentSessionId(sessionId);
+}
+
+export function forceClearReplyOperation(operation: ReplyOperation, cause?: unknown): boolean {
+  if (replyRunState.activeRunsByKey.get(operation.key) !== operation) {
     return false;
   }
   operation.fail("run_failed", cause);
   operation.complete();
   return true;
+}
+
+export function forceClearReplyRunBySessionId(sessionId: string, cause?: unknown): boolean {
+  const operation = resolveReplyRunForCurrentSessionId(sessionId);
+  return operation ? forceClearReplyOperation(operation, cause) : false;
 }
 
 export function clearReplyRunForResetBySessionId(sessionId: string): void {

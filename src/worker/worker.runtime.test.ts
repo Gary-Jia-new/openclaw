@@ -706,7 +706,7 @@ class FakeWorkerGateway {
 
 function descriptor(socketPath: string, workspaceDir: string): WorkerLaunchDescriptor {
   return {
-    version: 1,
+    version: 2,
     socketPath,
     admission: {
       environmentId: "worker-environment",
@@ -731,6 +731,9 @@ function descriptor(socketPath: string, workspaceDir: string): WorkerLaunchDescr
       initialMessages: [],
       transcript: { baseLeafId: "leaf-base", nextSeq: 3 },
       liveEvents: { ackedSeq: 0, nextSeq: 1 },
+      toolAuthority: {
+        allowedToolNames: ["read", "write", "edit", "apply_patch", "exec", "process"],
+      },
     },
   };
 }
@@ -806,6 +809,27 @@ describe("worker runtime", () => {
       transcriptLeafId: `leaf-${lastTranscript?.seq}`,
       transcriptNextSeq: (lastTranscript?.seq ?? 0) + 1,
     });
+  });
+
+  it("exposes exactly the Gateway-authorized worker tools", async () => {
+    const { gateway, launch } = await setup();
+    launch.assignment.toolAuthority.allowedToolNames = ["read", "exec"];
+
+    await expect(runWorkerDescriptor(launch)).resolves.toMatchObject({ status: "completed" });
+
+    expect(gateway.inferenceRequests[0]?.context.tools?.map((tool) => tool.name)).toEqual([
+      "read",
+      "exec",
+    ]);
+  });
+
+  it("runs with no tools when the Gateway authority is empty", async () => {
+    const { gateway, launch } = await setup();
+    launch.assignment.toolAuthority.allowedToolNames = [];
+
+    await expect(runWorkerDescriptor(launch)).resolves.toMatchObject({ status: "completed" });
+
+    expect(gateway.inferenceRequests[0]?.context.tools ?? []).toEqual([]);
   });
 
   it("fail-stops a stale mid-run transcript without duplicating or rebasing the paid tail", async () => {
@@ -1152,6 +1176,29 @@ describe("worker runtime", () => {
 });
 
 describe("worker reconnect clients", () => {
+  it("isolates ready listener failures while admitting the worker and starting heartbeats", async () => {
+    const { gateway, launch } = await setup({ heartbeatIntervalMs: 1 });
+    const connection = createWorkerConnection({
+      socketPath: gateway.socketPath,
+      connectParams: buildWorkerConnectParams(launch),
+    });
+    let healthyReadyCalls = 0;
+    connection.onReady(() => {
+      throw new Error("induced ready observer failure");
+    });
+    connection.onReady(() => {
+      healthyReadyCalls += 1;
+    });
+
+    try {
+      await expect(connection.start()).resolves.toMatchObject({ ownerEpoch: OWNER_EPOCH });
+      expect(healthyReadyCalls).toBe(1);
+      await waitForFast(() => expect(gateway.methods).toContain("worker.heartbeat"));
+    } finally {
+      await connection.stop();
+    }
+  });
+
   it("fails closed when the overall admission deadline expires", async () => {
     const { gateway, launch } = await setup({ admissionFailure: "gateway-unavailable" });
     const connection = createWorkerConnection({

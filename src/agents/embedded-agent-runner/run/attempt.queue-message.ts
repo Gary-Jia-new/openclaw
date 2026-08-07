@@ -3,13 +3,18 @@
  */
 import { toErrorObject } from "../../../infra/errors.js";
 import type { ImageContent } from "../../../llm/types.js";
+import type { MediaFact } from "../../../media/media-facts.js";
+import type { PromptImageOrderEntry } from "../../../media/prompt-image-order.js";
 import type { UserTurnTranscriptRecorder } from "../../../sessions/user-turn-transcript.types.js";
 import {
   cancelPendingAgentQuestionForSession,
   claimPendingAgentQuestionAnswer,
 } from "../../harness/gateway-question.js";
 import { log } from "../logger.js";
-import type { EmbeddedAgentQueueMessageOptions } from "../run-state.js";
+import type {
+  EmbeddedAgentQueueMessageOptions,
+  EmbeddedAgentQueueMessageResult,
+} from "../run-state.js";
 
 /**
  * Minimal active-session surface needed to steer a running attempt and observe
@@ -22,12 +27,37 @@ type EmbeddedAgentActiveSessionSteerTarget = {
     text: string,
     images?: ImageContent[],
     userTurnTranscriptRecorder?: UserTurnTranscriptRecorder,
+    media?: MediaFact[],
+    imageOrder?: PromptImageOrderEntry[],
   ): Promise<void>;
   subscribe(listener: (event: unknown) => void): () => void;
 };
 
 /** Default wait for a steered user message to appear in the active transcript. */
 const DEFAULT_QUEUE_TRANSCRIPT_COMMIT_TIMEOUT_MS = 120_000;
+
+class EmbeddedSteeringAcceptedUnconfirmedError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "EmbeddedSteeringAcceptedUnconfirmedError";
+  }
+}
+
+function steerActiveSession(
+  activeSession: EmbeddedAgentActiveSessionSteerTarget,
+  text: string,
+  images?: ImageContent[],
+  userTurnTranscriptRecorder?: UserTurnTranscriptRecorder,
+  media?: MediaFact[],
+  imageOrder?: PromptImageOrderEntry[],
+): Promise<void> {
+  if (media?.length) {
+    return activeSession.steer(text, images, userTurnTranscriptRecorder, media, imageOrder);
+  }
+  return userTurnTranscriptRecorder
+    ? activeSession.steer(text, images, userTurnTranscriptRecorder)
+    : activeSession.steer(text, images);
+}
 
 function extractQueuedUserMessageText(message: unknown): string | undefined {
   if (!message || typeof message !== "object") {
@@ -139,6 +169,8 @@ async function steerAndWaitForTranscriptCommit(
   timeoutMs: number,
   userTurnTranscriptRecorder?: UserTurnTranscriptRecorder,
   images?: ImageContent[],
+  media?: MediaFact[],
+  imageOrder?: PromptImageOrderEntry[],
 ): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     let settled = false;
@@ -168,14 +200,21 @@ async function steerAndWaitForTranscriptCommit(
         .then((removed) => {
           if (!removed) {
             log.warn("failed to find queued steering message for cancellation");
+            throw new EmbeddedSteeringAcceptedUnconfirmedError(message);
           }
         })
         .catch((err: unknown) => {
-          log.warn(`failed to cancel queued steering message: ${String(err)}`);
+          if (!(err instanceof EmbeddedSteeringAcceptedUnconfirmedError)) {
+            log.warn(`failed to cancel queued steering message: ${String(err)}`);
+          }
+          throw err instanceof EmbeddedSteeringAcceptedUnconfirmedError
+            ? err
+            : new EmbeddedSteeringAcceptedUnconfirmedError(message, { cause: err });
         })
-        .finally(() => {
-          finish(new Error(message));
-        });
+        .then(
+          () => finish(new Error(message)),
+          (error: unknown) => finish(error),
+        );
     };
     const scheduleTerminalCancellation = () => {
       if (terminalTimer) {
@@ -219,9 +258,14 @@ async function steerAndWaitForTranscriptCommit(
         scheduleTerminalCancellation();
       }
     });
-    const steer = userTurnTranscriptRecorder
-      ? activeSession.steer(text, images, userTurnTranscriptRecorder)
-      : activeSession.steer(text, images);
+    const steer = steerActiveSession(
+      activeSession,
+      text,
+      images,
+      userTurnTranscriptRecorder,
+      media,
+      imageOrder,
+    );
     steer.catch((err: unknown) => {
       finish(err);
     });
@@ -237,7 +281,7 @@ export async function steerActiveSessionWithOptionalDeliveryWait(
   text: string,
   options: EmbeddedAgentQueueMessageOptions | undefined,
   sessionKey?: string,
-): Promise<void> {
+): Promise<void | EmbeddedAgentQueueMessageResult> {
   const isInboundUserMessage = options?.isInboundUserMessage === true;
   const isPlainTextAnswer = !options?.images?.length;
   if (isInboundUserMessage && !isPlainTextAnswer) {
@@ -263,18 +307,30 @@ export async function steerActiveSessionWithOptionalDeliveryWait(
     return;
   }
   if (options?.waitForTranscriptCommit !== true) {
-    if (options?.userTurnTranscriptRecorder) {
-      await activeSession.steer(text, options.images, options.userTurnTranscriptRecorder);
-    } else {
-      await activeSession.steer(text, options?.images);
-    }
+    await steerActiveSession(
+      activeSession,
+      text,
+      options?.images,
+      options?.userTurnTranscriptRecorder,
+      options?.media,
+      options?.imageOrder,
+    );
     return;
   }
-  await steerAndWaitForTranscriptCommit(
-    activeSession,
-    text,
-    options.deliveryTimeoutMs ?? DEFAULT_QUEUE_TRANSCRIPT_COMMIT_TIMEOUT_MS,
-    options.userTurnTranscriptRecorder,
-    options.images,
-  );
+  try {
+    await steerAndWaitForTranscriptCommit(
+      activeSession,
+      text,
+      options.deliveryTimeoutMs ?? DEFAULT_QUEUE_TRANSCRIPT_COMMIT_TIMEOUT_MS,
+      options.userTurnTranscriptRecorder,
+      options.images,
+      options.media,
+      options.imageOrder,
+    );
+  } catch (error) {
+    if (error instanceof EmbeddedSteeringAcceptedUnconfirmedError) {
+      return { transcriptCommit: "unconfirmed", errorMessage: error.message };
+    }
+    throw error;
+  }
 }

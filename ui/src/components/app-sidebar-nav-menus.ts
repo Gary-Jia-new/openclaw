@@ -129,26 +129,6 @@ export function renderSidebarPluginTab(params: {
   `;
 }
 
-/** Unpinned routes and the pin editor live in a popup behind this row. */
-export function renderSidebarMoreRow(params: {
-  open: boolean;
-  active: boolean;
-  onToggle: (trigger: HTMLElement) => void;
-}) {
-  return html`
-    <button
-      type="button"
-      class="nav-item nav-item--action ${params.active ? "nav-item--active" : ""}"
-      aria-haspopup="menu"
-      aria-expanded=${String(params.open)}
-      @click=${(event: MouseEvent) => params.onToggle(event.currentTarget as HTMLElement)}
-    >
-      <span class="nav-item__icon" aria-hidden="true">${icons.moreHorizontal}</span>
-      <span class="nav-item__text">${t("nav.more")}</span>
-    </button>
-  `;
-}
-
 type SidebarMenuNavigationHandlers = {
   onNavigateRoute: (routeId: SidebarNavRoute) => void;
   onPreloadRoute: (routeId: SidebarNavRoute, event: Event) => void;
@@ -254,6 +234,7 @@ export function renderSidebarMoreMenu(params: SidebarMoreMenuParams) {
 type SidebarCustomizeMenuParams = {
   position: SidebarMenuPosition | null;
   sidebarEntries: readonly string[];
+  preferencesBrowserOnly: boolean;
   isRouteEnabled: (routeId: NavigationRouteId) => boolean;
   workboardBoards: readonly SidebarWorkboardBoard[];
   workboardRenderers?: SidebarWorkboardRenderers;
@@ -272,7 +253,7 @@ export function renderSidebarCustomizeMenu(params: SidebarCustomizeMenuParams) {
   return html`
     <openclaw-menu-surface>
       <wa-dropdown
-        class="sidebar-customize-menu"
+        class="sidebar-customize-menu sidebar-pin-editor-menu"
         .open=${true}
         placement="bottom-start"
         .distance=${0}
@@ -304,6 +285,11 @@ export function renderSidebarCustomizeMenu(params: SidebarCustomizeMenuParams) {
           style="position: fixed; left: ${position.x}px; top: ${position.y}px; width: 1px; height: 1px; opacity: 0; pointer-events: none;"
         ></button>
         <div class="sidebar-customize-menu__title">${t("nav.customize")}</div>
+        ${params.preferencesBrowserOnly
+          ? html`<div class="sidebar-customize-menu__provenance" role="note">
+              ${t("quickSettings.personal.browserOnly")}
+            </div>`
+          : nothing}
         ${SIDEBAR_NAV_ROUTES.filter((routeId) => params.isRouteEnabled(routeId)).map((routeId) => {
           const visible = params.sidebarEntries.includes(
             serializeSidebarEntry({ type: "route", route: routeId }),
@@ -336,19 +322,4 @@ export function renderSidebarCustomizeMenu(params: SidebarCustomizeMenuParams) {
       </wa-dropdown>
     </openclaw-menu-surface>
   `;
-}
-
-/** More row carries the active highlight when the current route lives inside its menu. */
-export function sidebarMoreMenuHoldsActiveRoute(params: {
-  activeRouteId: NavigationRouteId | undefined;
-  activeWorkboardBoardId?: string;
-  sidebarEntries: readonly string[];
-  isRouteEnabled: (routeId: NavigationRouteId) => boolean;
-}): boolean {
-  return sidebarMoreRoutes(params.sidebarEntries).some(
-    (routeId) =>
-      params.isRouteEnabled(routeId) &&
-      isSidebarRouteActive(params.activeRouteId, routeId) &&
-      !(routeId === "workboard" && params.activeWorkboardBoardId),
-  );
 }

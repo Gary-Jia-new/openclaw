@@ -5,13 +5,69 @@ import {
   createCompactionSummaryMessage,
   createCustomMessage,
 } from "../messages.js";
-import type { CompactionEntry, SessionContext, SessionTreeEntry } from "../types.js";
+import type { CompactionEntry, ResetEntry, SessionContext, SessionTreeEntry } from "../types.js";
+
+type ContextBoundary = CompactionEntry | ResetEntry;
+const SESSION_HISTORY_PRELUDE = Symbol.for("openclaw.sessionHistoryPrelude");
+
+/** Project persisted session entries into the message shared by replay and summarization. */
+export function projectSessionEntryMessage(entry: SessionTreeEntry): AgentMessage | undefined {
+  switch (entry.type) {
+    case "message":
+      return entry.message;
+    case "custom_message":
+      return asAgentMessage(
+        createCustomMessage(
+          entry.customType,
+          entry.content,
+          entry.display,
+          entry.details,
+          entry.timestamp,
+        ),
+      );
+    case "branch_summary":
+      return asAgentMessage(
+        createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp),
+      );
+    case "compaction":
+      return asAgentMessage(
+        createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp),
+      );
+    default:
+      return undefined;
+  }
+}
+
+function appendContextMessage(messages: AgentMessage[], entry: SessionTreeEntry): void {
+  if (entry.type === "compaction" || (entry.type === "branch_summary" && !entry.summary)) {
+    return;
+  }
+  const message = projectSessionEntryMessage(entry);
+  if (message) {
+    messages.push(message);
+  }
+}
+
+function appendResetKeptMessage(messages: AgentMessage[], entry: SessionTreeEntry): void {
+  if (
+    entry.type === "message" &&
+    (entry.message.role === "user" || entry.message.role === "assistant")
+  ) {
+    const message = { ...entry.message } as AgentMessage & { [SESSION_HISTORY_PRELUDE]?: true };
+    Object.defineProperty(message, SESSION_HISTORY_PRELUDE, {
+      configurable: true,
+      enumerable: false,
+      value: true,
+    });
+    messages.push(message);
+  }
+}
 
 /** Build model context from an ordered session branch and its latest state markers. */
 export function buildSessionContext(pathEntries: SessionTreeEntry[]): SessionContext {
   let thinkingLevel = "off";
   let model: { provider: string; modelId: string } | null = null;
-  let compaction: CompactionEntry | null = null;
+  let boundary: ContextBoundary | null = null;
 
   for (const entry of pathEntries) {
     if (entry.type === "thinking_level_change") {
@@ -20,64 +76,41 @@ export function buildSessionContext(pathEntries: SessionTreeEntry[]): SessionCon
       model = { provider: entry.provider, modelId: entry.modelId };
     } else if (entry.type === "message" && entry.message.role === "assistant") {
       model = { provider: entry.message.provider, modelId: entry.message.model };
-    } else if (entry.type === "compaction") {
-      compaction = entry;
+    } else if (entry.type === "compaction" || entry.type === "reset") {
+      boundary = entry;
     }
   }
 
   const messages: AgentMessage[] = [];
-  const appendMessage = (entry: SessionTreeEntry) => {
-    if (entry.type === "message") {
-      messages.push(entry.message);
-    } else if (entry.type === "custom_message") {
-      messages.push(
-        asAgentMessage(
-          createCustomMessage(
-            entry.customType,
-            entry.content,
-            entry.display,
-            entry.details,
-            entry.timestamp,
-          ),
-        ),
-      );
-    } else if (entry.type === "branch_summary" && entry.summary) {
-      messages.push(
-        asAgentMessage(createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp)),
-      );
+  if (boundary) {
+    if (boundary.type === "compaction") {
+      const summary = projectSessionEntryMessage(boundary);
+      if (summary) {
+        messages.push(summary);
+      }
     }
-  };
-
-  if (compaction) {
-    messages.push(
-      asAgentMessage(
-        createCompactionSummaryMessage(
-          compaction.summary,
-          compaction.tokensBefore,
-          compaction.timestamp,
-        ),
-      ),
-    );
-    const compactionIdx = pathEntries.findIndex(
-      (entry) => entry.type === "compaction" && entry.id === compaction.id,
-    );
-    // The synthetic summary replaces only history before the retained tail; newer branch
-    // entries must still replay or post-compaction turns disappear from model context.
+    const boundaryIdx = pathEntries.findIndex((entry) => entry.id === boundary.id);
+    // A reset kept tail mirrors the old cross-log replay contract: only user/assistant
+    // rows survive. Compaction keeps its existing richer retained-tail behavior.
     let foundFirstKept = false;
-    for (const entry of pathEntries.slice(0, compactionIdx)) {
-      if (entry.id === compaction.firstKeptEntryId) {
+    for (const entry of pathEntries.slice(0, boundaryIdx)) {
+      if (entry.id === boundary.firstKeptEntryId) {
         foundFirstKept = true;
       }
       if (foundFirstKept) {
-        appendMessage(entry);
+        if (boundary.type === "reset") {
+          appendResetKeptMessage(messages, entry);
+        } else {
+          appendContextMessage(messages, entry);
+        }
       }
     }
-    for (const entry of pathEntries.slice(compactionIdx + 1)) {
-      appendMessage(entry);
+    for (const entry of pathEntries.slice(boundaryIdx + 1)) {
+      appendContextMessage(messages, entry);
     }
   } else {
     for (const entry of pathEntries) {
-      appendMessage(entry);
+      appendContextMessage(messages, entry);
     }
   }
 

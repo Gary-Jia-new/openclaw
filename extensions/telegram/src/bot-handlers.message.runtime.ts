@@ -70,19 +70,17 @@ export function createTelegramHandlerMessageRuntime({
   const { resolveTelegramSessionState, resolvePromptContextAmbientWatermark } = sessionRuntime;
   const {
     recordMessageForReplyChain,
+    resolveCachedMessageThreadId,
     buildReplyChainForMessage,
     toReplyChainEntry,
     buildPromptContextForMessage,
-  } = createTelegramMessageContextRuntime(
-    {
-      cfg,
-      accountId,
-      opts,
-      telegramCfg,
-      telegramDeps,
-    },
-    sessionRuntime,
-  );
+  } = createTelegramMessageContextRuntime({
+    cfg,
+    accountId,
+    opts,
+    telegramCfg,
+    telegramDeps,
+  });
   const {
     normalizePromptContextMinTimestampMs,
     promptContextBoundaryOptions,
@@ -427,6 +425,7 @@ export function createTelegramHandlerMessageRuntime({
     resolveTelegramSessionState,
     resolvePromptContextAmbientWatermark,
     recordMessageForReplyChain,
+    resolveCachedMessageThreadId,
     processMessageWithReplyChain,
   };
 }
