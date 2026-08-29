@@ -4,9 +4,7 @@ import { buildHierarchyReinforcementMessage } from "./handoff-summarizer.js";
 const handoffHeader =
   "[SYSTEM HANDOFF] The previous model is no longer active and a fallback model is now active.";
 
-function getUserContent(
-  message: ReturnType<typeof buildHierarchyReinforcementMessage>,
-): string {
+function getUserContent(message: ReturnType<typeof buildHierarchyReinforcementMessage>): string {
   expect(message.role).toBe("user");
   if (message.role !== "user") {
     throw new Error(`expected user message, received ${message.role}`);
